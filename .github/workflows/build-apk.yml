@@ -110,17 +110,30 @@ jobs:
           sed -i "s/versionName \"1.0\"/versionName \"1.0.${{ github.run_number }}\"/" "$GRADLE"
 
           # Launcher icon from icon-512.png (replaces the default Capacitor icon)
+          # (uses the npm package "sharp" - no apt-get needed; if it fails the build still continues)
           if [ -f "www/icon-512.png" ]; then
-            sudo apt-get install -y -qq imagemagick >/dev/null
-            RES=android/app/src/main/res
-            rm -rf "$RES"/mipmap-anydpi-v26
-            for pair in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do
-              d="${pair%%:*}"; s="${pair##*:}"
-              mkdir -p "$RES/mipmap-$d"
-              convert www/icon-512.png -resize "${s}x${s}" "$RES/mipmap-$d/ic_launcher.png"
-              cp "$RES/mipmap-$d/ic_launcher.png" "$RES/mipmap-$d/ic_launcher_round.png"
-              cp "$RES/mipmap-$d/ic_launcher.png" "$RES/mipmap-$d/ic_launcher_foreground.png"
-            done
+            cat > make-icons.js <<'EOF'
+          const sharp = require('sharp');
+          const fs = require('fs');
+          const path = require('path');
+          const res = 'android/app/src/main/res';
+          const sizes = { mdpi: 48, hdpi: 72, xhdpi: 96, xxhdpi: 144, xxxhdpi: 192 };
+          (async () => {
+            fs.rmSync(path.join(res, 'mipmap-anydpi-v26'), { recursive: true, force: true });
+            for (const [d, s] of Object.entries(sizes)) {
+              const dir = path.join(res, 'mipmap-' + d);
+              fs.mkdirSync(dir, { recursive: true });
+              for (const n of ['ic_launcher', 'ic_launcher_round', 'ic_launcher_foreground']) {
+                await sharp('www/icon-512.png')
+                  .resize(s, s, { fit: 'contain', background: { r: 255, g: 255, b: 255, alpha: 0 } })
+                  .png().toFile(path.join(dir, n + '.png'));
+              }
+            }
+            console.log('Launcher icons generated');
+          })().catch(e => console.warn('Icon step skipped:', e.message));
+          EOF
+            npm install --no-save sharp || echo "sharp install failed - keeping default icon"
+            node make-icons.js || echo "Icon step skipped"
           fi
 
       - name: Build debug APK
