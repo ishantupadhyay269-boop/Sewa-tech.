@@ -1,1 +1,149 @@
+name: Build Android APK
 
+# Seva Tech Warriors is a PWA (index.html + sw.js + manifest). This workflow wraps it
+# in a Capacitor Android shell on the runner and compiles an installable APK.
+# Nothing extra is committed to your repo.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:   # lets you press "Run workflow" in the Actions tab
+
+permissions:
+  contents: write      # needed only for the optional release upload on tags
+
+env:
+  APP_NAME: Seva Tech Warriors
+  APP_ID: com.sevatechwarriors.app
+  CAPACITOR_VERSION: "7"
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Unzip project zip (if a .zip file is uploaded in the repo)
+        run: |
+          ZIP_FILE="$(find . -maxdepth 3 -type f -iname '*.zip' -not -path './.git/*' -not -path './node_modules/*' | head -n 1)"
+          if [ -n "$ZIP_FILE" ]; then
+            echo "Found zip: $ZIP_FILE"
+            mkdir -p _unzipped
+            unzip -q -o "$ZIP_FILE" -d _unzipped
+            rm -rf _unzipped/__MACOSX
+            echo "Unzipped contents:"
+            find _unzipped -maxdepth 3 | head -n 40
+            echo "UNZIPPED=true" >> "$GITHUB_ENV"
+          else
+            echo "No zip found - using files in the repo directly."
+          fi
+
+      - name: Locate web app folder (the one containing index.html)
+        run: |
+          if [ "$UNZIPPED" = "true" ]; then
+            INDEX="$(find _unzipped -name index.html -not -path '*/node_modules/*' | awk '{print length, $0}' | sort -n | head -n 1 | cut -d' ' -f2-)"
+            [ -n "$INDEX" ] || { echo "index.html not found inside the zip"; exit 1; }
+            WEB_DIR="$(dirname "$INDEX")"
+          elif [ -f index.html ]; then
+            WEB_DIR="."
+          elif [ -f Seva_Tech_Warriors/index.html ]; then
+            WEB_DIR="Seva_Tech_Warriors"
+          else
+            WEB_DIR="$(dirname "$(find . -name index.html -not -path '*/node_modules/*' | head -n 1)")"
+          fi
+          echo "Using web dir: $WEB_DIR"
+          test -f "$WEB_DIR/index.html" || { echo "index.html not found"; exit 1; }
+          echo "WEB_DIR=$WEB_DIR" >> "$GITHUB_ENV"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Set up Gradle (with caching)
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Create Capacitor Android project
+        run: |
+          mkdir _apk_build
+          mkdir _apk_build/www
+          tar -C "$WEB_DIR" --exclude='./.git' --exclude='./.github' --exclude='./_apk_build' --exclude='./_unzipped' --exclude='./node_modules' -cf - . | tar -C _apk_build/www -xf -
+          rm -rf _apk_build/www/README.md _apk_build/www/firebase.json _apk_build/www/firestore.rules _apk_build/www/*.zip
+
+          cd _apk_build
+          npm init -y >/dev/null
+          npm install "@capacitor/core@${CAPACITOR_VERSION}" "@capacitor/cli@${CAPACITOR_VERSION}" "@capacitor/android@${CAPACITOR_VERSION}"
+
+          cat > capacitor.config.json <<EOF
+          {
+            "appId": "${APP_ID}",
+            "appName": "${APP_NAME}",
+            "webDir": "www",
+            "server": { "androidScheme": "https" },
+            "android": { "allowMixedContent": false }
+          }
+          EOF
+
+          npx cap add android
+          npx cap sync android
+
+      - name: Configure Android (permissions, version, launcher icon)
+        working-directory: _apk_build
+        run: |
+          # Permissions used by the app: live location (SOS) and camera (responder selfie)
+          MANIFEST=android/app/src/main/AndroidManifest.xml
+          sed -i 's#</manifest>#    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />\n    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />\n    <uses-permission android:name="android.permission.CAMERA" />\n    <uses-feature android:name="android.hardware.camera" android:required="false" />\n</manifest>#' "$MANIFEST"
+
+          # Version: increases with every workflow run so updates install over old builds
+          GRADLE=android/app/build.gradle
+          sed -i "s/versionCode 1/versionCode ${{ github.run_number }}/" "$GRADLE"
+          sed -i "s/versionName \"1.0\"/versionName \"1.0.${{ github.run_number }}\"/" "$GRADLE"
+
+          # Launcher icon from icon-512.png (replaces the default Capacitor icon)
+          if [ -f "www/icon-512.png" ]; then
+            sudo apt-get install -y -qq imagemagick >/dev/null
+            RES=android/app/src/main/res
+            rm -rf "$RES"/mipmap-anydpi-v26
+            for pair in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do
+              d="${pair%%:*}"; s="${pair##*:}"
+              mkdir -p "$RES/mipmap-$d"
+              convert www/icon-512.png -resize "${s}x${s}" "$RES/mipmap-$d/ic_launcher.png"
+              cp "$RES/mipmap-$d/ic_launcher.png" "$RES/mipmap-$d/ic_launcher_round.png"
+              cp "$RES/mipmap-$d/ic_launcher.png" "$RES/mipmap-$d/ic_launcher_foreground.png"
+            done
+          fi
+
+      - name: Build debug APK
+        working-directory: _apk_build/android
+        run: ./gradlew assembleDebug --no-daemon
+
+      - name: Rename APK
+        run: |
+          mkdir -p dist
+          cp _apk_build/android/app/build/outputs/apk/debug/app-debug.apk "dist/Seva-Tech-Warriors-v1.0.${{ github.run_number }}.apk"
+          ls -lh dist
+
+      - name: Upload APK (download it from the run's Artifacts section)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Seva-Tech-Warriors-APK
+          path: dist/*.apk
+          if-no-files-found: error
+
+      # Optional: push a tag like v1.0.0 and the APK is attached to a GitHub Release
+      - name: Attach APK to GitHub Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.apk
+          
